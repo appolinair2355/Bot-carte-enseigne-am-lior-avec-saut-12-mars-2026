@@ -69,6 +69,11 @@ suits_received: Dict[str, list] = {'♠': [], '♥': [], '♦': [], '♣': []}  
 suits_missing: Dict[str, list] = {'♠': [], '♥': [], '♦': [], '♣': []}  # Costumes manquants par numéro
 SUITS_DATA_FILE = "suits_data.json"          # Fichier de persistance costumes
 PREDICTIONS_DATA_FILE = "predictions_data.json"  # Fichier de persistance prédictions
+OUTCOMES_DATA_FILE = "outcomes_data.json"    # Fichier de persistance résultats (PERDU + R3)
+
+# Suivi des résultats PERDU et ✅3️⃣ GAGNÉ pour le 3e PDF
+predictions_lost: List[Dict] = []   # {'game': N, 'suit': '♦'}
+predictions_r3: List[Dict] = []     # {'game': N, 'suit': '♦'}
 
 # NOUVEAU: Compteur1 - Gestion des costumes présents consécutifs
 compteur1_trackers: Dict[str, 'Compteur1Tracker'] = {}
@@ -522,6 +527,44 @@ def clear_predictions_data():
         logger.error(f"❌ Erreur suppression predictions_data: {e}")
 
 
+def save_outcomes_data():
+    """Sauvegarde predictions_lost et predictions_r3 dans un fichier JSON."""
+    import json
+    try:
+        data = {"predictions_lost": predictions_lost, "predictions_r3": predictions_r3}
+        with open(OUTCOMES_DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"❌ Erreur sauvegarde outcomes_data: {e}")
+
+
+def load_outcomes_data():
+    """Charge predictions_lost et predictions_r3 depuis le fichier JSON."""
+    import json, os
+    global predictions_lost, predictions_r3
+    if not os.path.exists(OUTCOMES_DATA_FILE):
+        return
+    try:
+        with open(OUTCOMES_DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        predictions_lost = data.get("predictions_lost", [])
+        predictions_r3   = data.get("predictions_r3", [])
+        logger.info(f"📂 outcomes_data chargé — {len(predictions_lost)} perdus, {len(predictions_r3)} R3")
+    except Exception as e:
+        logger.error(f"❌ Erreur chargement outcomes_data: {e}")
+
+
+def clear_outcomes_data():
+    """Supprime le fichier de persistance outcomes (appelé lors d'un reset complet)."""
+    import os
+    try:
+        if os.path.exists(OUTCOMES_DATA_FILE):
+            os.remove(OUTCOMES_DATA_FILE)
+            logger.info("🗑️ outcomes_data.json supprimé (reset)")
+    except Exception as e:
+        logger.error(f"❌ Erreur suppression outcomes_data: {e}")
+
+
 def initialize_trackers():
     """Initialise les trackers Compteur1 et Compteur2, et restaure les données PDF."""
     global compteur2_trackers, compteur1_trackers
@@ -533,6 +576,7 @@ def initialize_trackers():
     
     load_suits_data()
     load_predictions_data()
+    load_outcomes_data()
 
 def is_message_finalized(message: str) -> bool:
     if '⏰' in message:
@@ -774,30 +818,31 @@ def format_prediction_message(game_number: int, suit: str, status: str = 'en_cou
     suit_display = SUIT_DISPLAY.get(suit, suit)
     
     if status == 'en_cours':
+        # Carrés de vérification : on n'affiche que les jeux >= current_check
+        # Si current_check is None → état initial, on affiche les 4 avec 🔵 sur game_number
         verif_parts = []
+        effective = current_check if current_check is not None else game_number
         for i in range(4):
             check_num = game_number + i
-            if current_check == check_num:
+            if check_num < effective:
+                continue  # jeu déjà vérifié (et raté) → retiré
+            elif check_num == effective:
                 verif_parts.append(f"🔵{check_num}")
-            elif verified_games and check_num in verified_games:
-                continue
             else:
                 verif_parts.append(f"⬜{check_num}")
         
         verif_line = " | ".join(verif_parts)
         
-        r_emojis = {0: '', 1: '✅1️⃣', 2: '✅2️⃣', 3: '✅3️⃣'}
-        r_label = r_emojis.get(rattrapage, f'R{rattrapage}')
-        if rattrapage > 0:
-            statut_line = f"🔄 Statut: {r_label} En cours..."
+        if current_check is None:
+            statut_line = "⏳ En cours:⌛"
         else:
-            statut_line = f"⏳ Statut: En cours..."
+            statut_line = f"⏳ En cours:🔎{current_check}⌛"
         
         return (
-            f"🏆 PRÉDICTION #{game_number}\n\n"
-            f"🎯 Couleur: {suit_display}\n"
-            f"{statut_line}\n"
-            f"🔍 {verif_line}"
+            f"🎯 Prédiction #{game_number}\n"
+            f"🃏 Couleur : {suit_display}\n"
+            f"{statut_line} \n"
+            f" {verif_line}"
         )
     
     elif status == 'gagne':
@@ -929,7 +974,7 @@ async def send_prediction_to_channel(channel_id: int, game_number: int, suit: st
             logger.error(f"❌ Canal {channel_id} inaccessible")
             return None
         
-        msg = format_prediction_message(game_number, suit, 'en_cours', game_number, [])
+        msg = format_prediction_message(game_number, suit, 'en_cours', None, [])
         
         sent = await client.send_message(channel_entity, msg, parse_mode='markdown')
         logger.info(f"✅ Envoyé à {'canal secondaire' if is_secondary else 'canal principal'} {channel_id}: #{game_number} {suit}")
@@ -1034,9 +1079,14 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
     
     if is_win:
         logger.info(f"✅ Gagné: #{game_number} (R{rattrapage})")
+        if rattrapage == 3:
+            predictions_r3.append({'game': game_number, 'suit': suit})
+            save_outcomes_data()
     else:
         logger.info(f"❌ Perdu: #{game_number}")
         block_suit(suit, 5)
+        predictions_lost.append({'game': game_number, 'suit': suit})
+        save_outcomes_data()
     
     # ── SECTION SYNCHRONE (aucun await) ─────────────────────────────────────
     # Tout ce qui suit se fait AVANT le premier await.
@@ -1155,6 +1205,9 @@ async def check_prediction_result(game_number: int, first_group: str) -> bool:
         
         if game_number in pred['verified_games']:
             return False
+        
+        # Afficher 🔎game_number dès que la vérification commence
+        await update_prediction_progress(game_number, game_number)
         
         pred['verified_games'].append(game_number)
         
@@ -1640,6 +1693,7 @@ async def perform_full_reset(reason: str):
     global compteur1_trackers, compteur1_history
     global processed_game_numbers, suits_received, suits_missing
     global debounce_tasks, debounce_pending
+    global predictions_lost, predictions_r3
     
     stats = len(pending_predictions)
     queue_stats = len(prediction_queue)
@@ -1678,8 +1732,11 @@ async def perform_full_reset(reason: str):
     processed_game_numbers.clear()
     suits_received = {'♠': [], '♥': [], '♦': [], '♣': []}
     suits_missing  = {'♠': [], '♥': [], '♦': [], '♣': []}
+    predictions_lost.clear()
+    predictions_r3.clear()
     clear_suits_data()
     clear_predictions_data()
+    clear_outcomes_data()
     # Annuler tous les debounces en cours
     for task in list(debounce_tasks.values()):
         if not task.done():
@@ -2524,12 +2581,101 @@ def generate_missing_pdf() -> str:
     return path
 
 
+def _pdf_draw_outcomes_section(c, page_w, y, title: str, items: list,
+                               margin=50, bottom=60, line_h=14) -> float:
+    """Dessine une section outcomes (PERDU ou R3) en format 'game:emoji'."""
+    if y < bottom + 40:
+        c.showPage()
+        y = 750
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(margin, y, title)
+    y -= 18
+
+    if not items:
+        c.setFont("Helvetica-Oblique", 10)
+        c.drawString(margin + 10, y, "Aucun")
+        y -= line_h
+        return y
+
+    suit_emoji = {'♠': '♠', '♥': '♥', '♦': '♦', '♣': '♣'}
+    max_w = page_w - margin * 2
+    tokens = [f"{it['game']}:{suit_emoji.get(it['suit'], it['suit'])}" for it in items]
+
+    c.setFont("Helvetica", 10)
+    line_buf = []
+    line_w = 0
+    for tok in tokens:
+        tok_w = c.stringWidth(tok + "  ", "Helvetica", 10)
+        if line_w + tok_w > max_w and line_buf:
+            line_text = "  ".join(line_buf)
+            if y < bottom:
+                c.showPage()
+                y = 750
+                c.setFont("Helvetica", 10)
+            c.drawString(margin + 10, y, line_text)
+            y -= line_h
+            line_buf = [tok]
+            line_w = tok_w
+        else:
+            line_buf.append(tok)
+            line_w += tok_w
+
+    if line_buf:
+        if y < bottom:
+            c.showPage()
+            y = 750
+            c.setFont("Helvetica", 10)
+        c.drawString(margin + 10, y, "  ".join(line_buf))
+        y -= line_h
+
+    y -= 10
+    return y
+
+
+def generate_outcomes_pdf() -> str:
+    """Génère un PDF avec les résultats PERDU et R3 GAGNÉ. Format: 'game:suit'."""
+    import tempfile
+    from reportlab.pdfgen import canvas as pdf_canvas
+    from reportlab.lib.pagesizes import letter
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    tmp.close()
+    path = tmp.name
+
+    page_w, page_h = letter
+    c = pdf_canvas.Canvas(path, pagesize=letter)
+    c.setTitle("Resultats PERDU et R3 1-1440")
+
+    y = page_h - 50
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, y, "RESULTATS PERDU / R3 GAGNE - Jeux 1 a 1440")
+    y -= 10
+    c.setLineWidth(1)
+    c.line(50, y, page_w - 50, y)
+    y -= 25
+
+    y = _pdf_draw_outcomes_section(
+        c, page_w, y,
+        f"PERDU ({len(predictions_lost)} predictions)",
+        predictions_lost
+    )
+    y = _pdf_draw_outcomes_section(
+        c, page_w, y,
+        f"R3 GAGNE ({len(predictions_r3)} predictions)",
+        predictions_r3
+    )
+
+    c.save()
+    return path
+
+
 async def send_pdfs_to_admin():
     """Envoie les deux PDFs au chat privé de l'admin."""
     import os as _os
     try:
         path1 = generate_suits_pdf()
         path2 = generate_missing_pdf()
+        path3 = generate_outcomes_pdf()
         await client.send_file(
             ADMIN_ID, path1,
             caption="📊 Costumes RECUS (1-1440)",
@@ -2542,10 +2688,17 @@ async def send_pdfs_to_admin():
             file_name="costumes_manquants.pdf",
             force_document=True
         )
+        await client.send_file(
+            ADMIN_ID, path3,
+            caption="📊 Résultats PERDU / R3 GAGNÉ (1-1440)",
+            file_name="resultats_perdu_r3.pdf",
+            force_document=True
+        )
         logger.info("✅ PDFs envoyés à l'admin")
         try:
             _os.remove(path1)
             _os.remove(path2)
+            _os.remove(path3)
         except Exception:
             pass
     except Exception as e:
@@ -2564,6 +2717,7 @@ async def cmd_export_pdf(event):
         await event.respond("📄 Génération des PDFs en cours...")
         path1 = generate_suits_pdf()
         path2 = generate_missing_pdf()
+        path3 = generate_outcomes_pdf()
         await event.client.send_file(
             event.sender_id, path1,
             caption="📊 Costumes RECUS (1-1440)",
@@ -2576,10 +2730,17 @@ async def cmd_export_pdf(event):
             file_name="costumes_manquants.pdf",
             force_document=True
         )
+        await event.client.send_file(
+            event.sender_id, path3,
+            caption="📊 Résultats PERDU / R3 GAGNÉ (1-1440)",
+            file_name="resultats_perdu_r3.pdf",
+            force_document=True
+        )
         await event.respond("✅ PDFs envoyés !")
         try:
             _os.remove(path1)
             _os.remove(path2)
+            _os.remove(path3)
         except Exception:
             pass
     except Exception as e:
